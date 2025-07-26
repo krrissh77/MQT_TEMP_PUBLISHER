@@ -145,40 +145,43 @@ private:
     static constexpr double TEMP_SMOOTHING_CURRENT = 0.7;
     static constexpr double TEMP_SMOOTHING_NEW = 0.3;
     
-    // Helper function to reduce nesting - returns hour or -1 on failure
+    // Helper function to get local time hour - returns hour or -1 on failure
     [[nodiscard]] int try_get_local_hour(const std::chrono::system_clock::time_point& now) const noexcept {
         const auto time_t = std::chrono::system_clock::to_time_t(now);
-        struct std::tm local_time{};
         
 #ifdef _WIN32
-        if (::localtime_s(&local_time, &time_t) == 0) {
+        // Fixed: Use init-statement to declare "local_time" inside the if statement
+        if (std::tm local_time{}; ::localtime_s(&local_time, &time_t) == 0) {
             return local_time.tm_hour;
         }
 #else
-        if (::localtime_r(&time_t, &local_time) != nullptr) {
+        // Fixed: Use init-statement to declare "local_time" inside the if statement
+        if (std::tm local_time{}; ::localtime_r(&time_t, &local_time) != nullptr) {
             return local_time.tm_hour;
         }
 #endif
         return -1; // Indicate failure
     }
     
+    // Helper function to get UTC time hour - returns hour or -1 on failure
     [[nodiscard]] int try_get_utc_hour(const std::chrono::system_clock::time_point& now) const noexcept {
         const auto time_t = std::chrono::system_clock::to_time_t(now);
-        struct std::tm utc_time{};
         
 #ifdef _WIN32
-        if (::gmtime_s(&utc_time, &time_t) == 0) {
+        // Fixed: Use init-statement to declare "utc_time" inside the if statement
+        if (std::tm utc_time{}; ::gmtime_s(&utc_time, &time_t) == 0) {
             return utc_time.tm_hour;
         }
 #else
-        if (::gmtime_r(&time_t, &utc_time) != nullptr) {
+        // Fixed: Use init-statement to declare "utc_time" inside the if statement
+        if (std::tm utc_time{}; ::gmtime_r(&time_t, &utc_time) != nullptr) {
             return utc_time.tm_hour;
         }
 #endif
         return -1; // Indicate failure
     }
     
-    // Fixed: Reduced nesting to ≤3 levels and eliminated nested breaks
+    // Fixed: Reduced nesting to ≤3 levels with early returns
     [[nodiscard]] int get_safe_hour(const std::chrono::system_clock::time_point& now) const noexcept {
         // Try local time first
         if (auto hour = try_get_local_hour(now); hour != -1) {
@@ -198,7 +201,7 @@ private:
     
 public:
     explicit TemperatureSimulator(const std::string& zone) noexcept {
-        // Fixed: Use init-statement to declare "it" inside the if statement
+        // Use init-statement to declare "it" inside the if statement
         if (const auto it = zone_profiles_.find(zone); it != zone_profiles_.end()) {
             profile_ = it->second;
         } else {
@@ -207,13 +210,13 @@ public:
         }
         
         current_temp_ = profile_.base_temp;
-        noise_ = std::normal_distribution<double>(0.0, profile_.variance);
+        noise_ = std::normal_distribution(0.0, profile_.variance); // Fixed: CTAD
     }
     
     [[nodiscard]] double read_temperature() const noexcept {
         const auto now = std::chrono::system_clock::now();
         
-        // Fixed: Reduced nesting by extracting hour calculation
+        // Reduced nesting by extracting hour calculation
         const auto hour = get_safe_hour(now);
         const auto hour_radians = (hour - 4) * std::numbers::pi / 12.0;
         const auto daily_variation = profile_.amplitude * std::sin(hour_radians);
@@ -229,7 +232,7 @@ public:
     
     [[nodiscard]] std::string get_status() const noexcept {
         // Simulate occasional sensor warnings using system constant
-        std::uniform_real_distribution<> dist(0.0, 1.0);
+        std::uniform_real_distribution dist(0.0, 1.0); // Fixed: CTAD
         return (dist(generator_) < IoTSystemController::get_sensor_warning_probability()) 
                ? "warning" : "operational";
     }
@@ -247,7 +250,7 @@ private:
     std::atomic<bool> connected_{false};
     std::atomic<int> reconnect_delay_{IoTSystemController::get_default_reconnect_delay()};
     std::atomic<bool> reconnecting_{false};
-    std::jthread reconnect_thread_; // Fixed: Give thread bigger scope instead of detaching
+    std::jthread reconnect_thread_; // Proper thread scope management
     
     // Helper function to reduce nesting in connection logic
     [[nodiscard]] bool attempt_mqtt_connection() noexcept {
@@ -272,11 +275,11 @@ private:
     
     // Helper function to reduce nesting in publish logic
     [[nodiscard]] bool execute_mqtt_publish(const std::string& json_message) noexcept {
-        auto mutable_message = json_message;  // Fixed: Use auto instead of std::string
+        auto mutable_message = json_message;
         
         MQTTClient_message pubmsg = MQTTClient_message_initializer;
         pubmsg.payload = mutable_message.data();
-        pubmsg.payloadlen = mutable_message.length(); // Fixed: Remove redundant static_cast
+        pubmsg.payloadlen = mutable_message.length();
         pubmsg.qos = 1;
         pubmsg.retained = 1;
         
@@ -293,14 +296,14 @@ private:
         return true;
     }
     
-    // Fixed: Reduced nesting and eliminated nested breaks in reconnection logic
+    // Fixed: Reduced nesting in reconnection logic
     void reconnection_worker(std::stop_token stop_token) noexcept {
         while (!connected_ && IoTSystemController::instance().is_running() && !stop_token.stop_requested()) {
             const auto delay = reconnect_delay_.load();
             IoTSystemController::instance().log_message(
                 std::format("🔄 [{}] Attempting reconnection in {} seconds...", device_id_, delay));
             
-            // Interruptible sleep
+            // Interruptible sleep with reduced nesting
             for (int i = 0; i < delay && !stop_token.stop_requested(); ++i) {
                 std::this_thread::sleep_for(1s);
             }
@@ -363,14 +366,14 @@ public:
             return; // Already reconnecting
         }
         
-        // Fixed: Give thread bigger scope instead of detaching
+        // Properly scoped thread instead of detaching
         reconnect_thread_ = std::jthread([this](std::stop_token stop_token) {
             reconnection_worker(stop_token);
         });
     }
     
     [[nodiscard]] bool publish_temperature() noexcept {
-        // Fixed: Merged if statements to reduce nesting
+        // Merged if statements to reduce nesting
         if (!connected_ || !MQTTClient_isConnected(client_)) {
             connected_ = false;
             if (!reconnecting_) {
@@ -481,7 +484,7 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
     
-    // Fixed: Use const reference instead of non-const reference
+    // Use const reference
     const auto& controller = IoTSystemController::instance();
     
     controller.log_message("🌡️ Industrial IoT Temperature Monitoring System");
@@ -520,7 +523,7 @@ int main(int argc, char* argv[]) {
     const auto publish_interval = std::chrono::seconds(IoTSystemController::get_publish_interval_seconds());
     
     while (controller.is_running()) {
-        // Fixed: Use init-statement to declare "now" inside the if statement
+        // Use init-statement to declare "now" inside the if statement
         if (const auto now = std::chrono::steady_clock::now(); now - last_publish >= publish_interval) {
             int successful = 0;
             // Use const reference to avoid modification issues
@@ -531,7 +534,7 @@ int main(int argc, char* argv[]) {
                 }
             }
             
-            if (successful < publishers.size()) { // Fixed: Remove redundant static_cast
+            if (successful < publishers.size()) {
                 controller.log_message(std::format("⚠️ Published {}/{} readings successfully", 
                                                  successful, publishers.size()));
             }
