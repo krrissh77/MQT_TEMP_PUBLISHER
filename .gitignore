@@ -1,0 +1,17 @@
+﻿# Build artifacts
+*.o
+*.obj
+/build/
+
+# Package managers
+/vcpkg/
+/paho.mqtt.cpp/
+
+# Temporary files
+*.tmp
+*.log
+
+# Editor files
+.vscode/
+.idea/
+*~
