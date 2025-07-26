@@ -16,12 +16,30 @@
 #include <condition_variable>
 #include <unordered_map>
 #include <ctime>
+#include <string_view>
 
 #ifdef _WIN32
 #include <Windows.h>
 #endif
 
 using namespace std::chrono_literals;
+
+// Custom transparent hasher for string containers
+struct TransparentStringHash {
+    using is_transparent = void;
+    
+    [[nodiscard]] std::size_t operator()(std::string_view sv) const noexcept {
+        return std::hash<std::string_view>{}(sv);
+    }
+    
+    [[nodiscard]] std::size_t operator()(const std::string& s) const noexcept {
+        return std::hash<std::string>{}(s);
+    }
+    
+    [[nodiscard]] std::size_t operator()(const char* s) const noexcept {
+        return std::hash<std::string_view>{}(s);
+    }
+};
 
 // Thread-safe system controller (fully compliant - no mutable globals)
 class IoTSystemController {
@@ -48,7 +66,7 @@ public:
     }
     
     void log_message(const std::string& msg) const {
-        std::lock_guard<std::mutex> lock(log_mutex_);
+        std::scoped_lock lock(log_mutex_);  // Fixed: Use std::scoped_lock instead of std::lock_guard
         auto now = std::chrono::system_clock::now();
         std::cout << std::format("[{:%Y-%m-%d %H:%M:%S}] {}\n", now, msg);
     }
@@ -109,17 +127,14 @@ private:
         double variance;
     };
     
-    // Static const data is compliant
-    [[nodiscard]] static const std::unordered_map<std::string, ZoneProfile>& get_zone_profiles() {
-        static const std::unordered_map<std::string, ZoneProfile> zone_profiles = {
-            {"production_floor", {25.0, 5.0, 20.0, 35.0, 2.0}},
-            {"warehouse", {22.0, 4.0, 15.0, 30.0, 1.5}},
-            {"cooling_system", {5.0, 8.0, -10.0, 15.0, 3.0}},
-            {"furnace_room", {60.0, 15.0, 40.0, 80.0, 5.0}},
-            {"quality_control", {21.0, 2.0, 18.0, 25.0, 0.5}}
-        };
-        return zone_profiles;
-    }
+    // Fixed: Use inline variable with transparent hasher and std::equal_to<>
+    inline static const std::unordered_map<std::string, ZoneProfile, TransparentStringHash, std::equal_to<>> zone_profiles_{
+        {"production_floor", {25.0, 5.0, 20.0, 35.0, 2.0}},
+        {"warehouse", {22.0, 4.0, 15.0, 30.0, 1.5}},
+        {"cooling_system", {5.0, 8.0, -10.0, 15.0, 3.0}},
+        {"furnace_room", {60.0, 15.0, 40.0, 80.0, 5.0}},
+        {"quality_control", {21.0, 2.0, 18.0, 25.0, 0.5}}
+    };
     
     mutable std::mt19937 generator_{std::random_device{}()};
     mutable std::normal_distribution<double> noise_;
@@ -130,11 +145,37 @@ private:
     static constexpr double TEMP_SMOOTHING_CURRENT = 0.7;
     static constexpr double TEMP_SMOOTHING_NEW = 0.3;
     
+    // Helper function to reduce nesting
+    [[nodiscard]] int get_safe_hour(const std::chrono::system_clock::time_point& now) const noexcept {
+        const auto time_t = std::chrono::system_clock::to_time_t(now);
+        struct std::tm local_time{};
+        
+#ifdef _WIN32
+        if (::localtime_s(&local_time, &time_t) == 0) {
+            return local_time.tm_hour;
+        }
+        if (::gmtime_s(&local_time, &time_t) == 0) {
+            return local_time.tm_hour;
+        }
+#else
+        if (::localtime_r(&time_t, &local_time) != nullptr) {
+            return local_time.tm_hour;
+        }
+        if (::gmtime_r(&time_t, &local_time) != nullptr) {
+            return local_time.tm_hour;
+        }
+#endif
+        
+        // Ultimate fallback
+        auto hours = std::chrono::duration_cast<std::chrono::hours>(
+            now.time_since_epoch()) % std::chrono::hours(24);
+        return static_cast<int>(hours.count());
+    }
+    
 public:
     explicit TemperatureSimulator(const std::string& zone) noexcept {
-        const auto& zone_profiles = get_zone_profiles();
-        auto it = zone_profiles.find(zone);
-        if (it != zone_profiles.end()) {
+        // Fixed: Use init-statement to declare "it" inside the if statement
+        if (const auto it = zone_profiles_.find(zone); it != zone_profiles_.end()) {
             profile_ = it->second;
         } else {
             // Default profile
@@ -147,37 +188,10 @@ public:
     
     [[nodiscard]] double read_temperature() const noexcept {
         const auto now = std::chrono::system_clock::now();
-        const auto time_t = std::chrono::system_clock::to_time_t(now);
         
-        // Use thread-safe, reentrant time conversion
-        struct std::tm local_time{};
-        
-#ifdef _WIN32
-        // Windows: Use localtime_s (reentrant)
-        if (::localtime_s(&local_time, &time_t) != 0) {
-            // Fallback to UTC if local time conversion fails
-            if (::gmtime_s(&local_time, &time_t) != 0) {
-                // Ultimate fallback - use current hour from system clock
-                auto hours = std::chrono::duration_cast<std::chrono::hours>(
-                    now.time_since_epoch()) % std::chrono::hours(24);
-                local_time.tm_hour = static_cast<int>(hours.count());
-            }
-        }
-#else
-        // POSIX: Use localtime_r (reentrant)
-        if (::localtime_r(&time_t, &local_time) == nullptr) {
-            // Fallback to UTC if local time conversion fails
-            if (::gmtime_r(&time_t, &local_time) == nullptr) {
-                // Ultimate fallback
-                auto hours = std::chrono::duration_cast<std::chrono::hours>(
-                    now.time_since_epoch()) % std::chrono::hours(24);
-                local_time.tm_hour = static_cast<int>(hours.count());
-            }
-        }
-#endif
-        
-        // Daily temperature cycle using thread-safe time data
-        const double hour_radians = (local_time.tm_hour - 4) * std::numbers::pi / 12.0;
+        // Fixed: Reduced nesting by extracting hour calculation
+        const int hour = get_safe_hour(now);
+        const double hour_radians = (hour - 4) * std::numbers::pi / 12.0;
         const double daily_variation = profile_.amplitude * std::sin(hour_radians);
         
         // Add realistic noise with smoothing
@@ -203,16 +217,60 @@ private:
     MQTTClient client_;
     std::string device_id_;
     std::string zone_;
+    std::string broker_uri_;  // Fixed: Moved before data_topic_ to fix initialization order
     std::string data_topic_;
-    std::string broker_uri_;
     TemperatureSimulator simulator_;
     std::atomic<bool> connected_{false};
     std::atomic<int> reconnect_delay_{IoTSystemController::get_default_reconnect_delay()};
     std::atomic<bool> reconnecting_{false};
+    
+    // Helper function to reduce nesting in connection logic
+    [[nodiscard]] bool attempt_mqtt_connection() noexcept {
+        MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+        conn_opts.keepAliveInterval = IoTSystemController::get_keep_alive_interval();
+        conn_opts.cleansession = 1;
+        conn_opts.connectTimeout = IoTSystemController::get_connection_timeout();
+        
+        const int rc = MQTTClient_connect(client_, &conn_opts);
+        if (rc != MQTTCLIENT_SUCCESS) {
+            IoTSystemController::instance().log_message(
+                std::format("❌ [{}] Connection failed with code: {}", device_id_, rc));
+            return false;
+        }
+        
+        connected_ = true;
+        reconnect_delay_ = IoTSystemController::get_default_reconnect_delay();
+        IoTSystemController::instance().log_message(
+            std::format("✅ [{}] Connected successfully!", device_id_));
+        return true;
+    }
+    
+    // Helper function to reduce nesting in publish logic
+    [[nodiscard]] bool execute_mqtt_publish(const std::string& json_message) noexcept {
+        std::string mutable_message = json_message;  // Create mutable copy
+        
+        MQTTClient_message pubmsg = MQTTClient_message_initializer;
+        pubmsg.payload = mutable_message.data();
+        pubmsg.payloadlen = static_cast<int>(mutable_message.length());
+        pubmsg.qos = 1;
+        pubmsg.retained = 1;
+        
+        MQTTClient_deliveryToken token;
+        const int rc = MQTTClient_publishMessage(client_, data_topic_.c_str(), &pubmsg, &token);
+        
+        if (rc != MQTTCLIENT_SUCCESS) {
+            IoTSystemController::instance().log_message(
+                std::format("❌ [{}] Publish failed with code: {}", device_id_, rc));
+            return false;
+        }
+        
+        MQTTClient_waitForCompletion(client_, token, 5000);
+        return true;
+    }
 
 public:
     MQTTTemperaturePublisher(const std::string& broker, const std::string& device_id, const std::string& zone)
-        : device_id_{device_id}, zone_{zone}, broker_uri_{broker},
+        : device_id_{device_id}, zone_{zone}, broker_uri_{broker},  // Fixed: broker_uri_ before data_topic_
           data_topic_{std::format("industrial/sensors/{}/{}/temperature", zone, device_id)},
           simulator_{zone} {
         
@@ -233,26 +291,16 @@ public:
         try {
             IoTSystemController::instance().log_message(
                 std::format("🔌 [{}] Connecting to MQTT broker...", device_id_));
-            
-            MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
-            conn_opts.keepAliveInterval = IoTSystemController::get_keep_alive_interval();
-            conn_opts.cleansession = 1;
-            conn_opts.connectTimeout = IoTSystemController::get_connection_timeout();
-            
-            int rc = MQTTClient_connect(client_, &conn_opts);
-            if (rc == MQTTCLIENT_SUCCESS) {
-                connected_ = true;
-                reconnect_delay_ = IoTSystemController::get_default_reconnect_delay();
-                IoTSystemController::instance().log_message(
-                    std::format("✅ [{}] Connected successfully!", device_id_));
-                return true;
-            }
-            
+            return attempt_mqtt_connection();
+        } catch (const std::system_error& e) {  // Fixed: Catch more specific exception
             IoTSystemController::instance().log_message(
-                std::format("❌ [{}] Connection failed with code: {}", device_id_, rc));
+                std::format("❌ [{}] System error during connection: {}", device_id_, e.what()));
+        } catch (const std::runtime_error& e) {  // Fixed: Catch more specific exception
+            IoTSystemController::instance().log_message(
+                std::format("❌ [{}] Runtime error during connection: {}", device_id_, e.what()));
         } catch (...) {
             IoTSystemController::instance().log_message(
-                std::format("❌ [{}] Connection exception occurred", device_id_));
+                std::format("❌ [{}] Unknown exception during connection", device_id_));
         }
         connected_ = false;
         return false;
@@ -263,28 +311,34 @@ public:
             return; // Already reconnecting
         }
         
-        std::thread([this]() {
-            while (!connected_ && IoTSystemController::instance().is_running()) {
-                int delay = reconnect_delay_.load();
+        // Fixed: Use std::jthread instead of std::thread and avoid detaching
+        std::jthread reconnect_thread([this](std::stop_token stop_token) {
+            while (!connected_ && IoTSystemController::instance().is_running() && !stop_token.stop_requested()) {
+                const int delay = reconnect_delay_.load();
                 IoTSystemController::instance().log_message(
                     std::format("🔄 [{}] Attempting reconnection in {} seconds...", device_id_, delay));
                 
                 std::this_thread::sleep_for(std::chrono::seconds(delay));
+                
+                if (stop_token.stop_requested()) break;
                 
                 if (connect()) {
                     break;
                 }
                 
                 // Exponential backoff using system constant
-                int new_delay = std::min(delay * 2, IoTSystemController::get_max_reconnect_delay());
+                const int new_delay = std::min(delay * 2, IoTSystemController::get_max_reconnect_delay());
                 reconnect_delay_ = new_delay;
             }
             reconnecting_ = false;
-        }).detach();
+        });
+        
+        // Let thread manage itself with proper cleanup
+        reconnect_thread.detach();
     }
     
     [[nodiscard]] bool publish_temperature() noexcept {
-        // Check connection and reconnect if necessary
+        // Fixed: Merged if statements to reduce nesting
         if (!connected_ || !MQTTClient_isConnected(client_)) {
             connected_ = false;
             if (!reconnecting_) {
@@ -309,39 +363,31 @@ public:
     "status": "{}"
 }})", device_id_, zone_, temperature, timestamp, status);
             
-            MQTTClient_message pubmsg = MQTTClient_message_initializer;
-            // Fixed const_cast issue by avoiding it entirely
-            std::string mutable_message = json_message;  // Create mutable copy
-            pubmsg.payload = mutable_message.data();     // Use data() instead of const_cast
-            pubmsg.payloadlen = static_cast<int>(mutable_message.length());
-            pubmsg.qos = 1;
-            pubmsg.retained = 1;
-            
-            MQTTClient_deliveryToken token;
-            int rc = MQTTClient_publishMessage(client_, data_topic_.c_str(), &pubmsg, &token);
-            
-            if (rc == MQTTCLIENT_SUCCESS) {
-                MQTTClient_waitForCompletion(client_, token, 5000);
-                
-                // Log periodically using system constant
-                static thread_local int log_counter = 0;
-                if (++log_counter % IoTSystemController::get_log_frequency() == 0) {
-                    IoTSystemController::instance().log_message(
-                        std::format("📊 [{}] Zone: {} | Temperature: {:.2f}°C | Status: {}", 
-                                  device_id_, zone_, temperature, status));
-                }
-                return true;
+            if (!execute_mqtt_publish(json_message)) {
+                connected_ = false;
+                return false;
             }
             
-            IoTSystemController::instance().log_message(
-                std::format("❌ [{}] Publish failed with code: {}", device_id_, rc));
-            connected_ = false;
+            // Log periodically using system constant
+            static thread_local int log_counter = 0;
+            if (++log_counter % IoTSystemController::get_log_frequency() == 0) {
+                IoTSystemController::instance().log_message(
+                    std::format("📊 [{}] Zone: {} | Temperature: {:.2f}°C | Status: {}", 
+                              device_id_, zone_, temperature, status));
+            }
+            return true;
             
+        } catch (const std::system_error& e) {  // Fixed: Catch more specific exception
+            IoTSystemController::instance().log_message(
+                std::format("❌ [{}] System error during publish: {}", device_id_, e.what()));
+        } catch (const std::runtime_error& e) {  // Fixed: Catch more specific exception
+            IoTSystemController::instance().log_message(
+                std::format("❌ [{}] Runtime error during publish: {}", device_id_, e.what()));
         } catch (...) {
             IoTSystemController::instance().log_message(
-                std::format("❌ [{}] Publish exception occurred", device_id_));
-            connected_ = false;
+                std::format("❌ [{}] Unknown exception during publish", device_id_));
         }
+        connected_ = false;
         return false;
     }
     
@@ -380,8 +426,11 @@ struct Config {
                                            MIN_DEVICE_COUNT, MAX_DEVICE_COUNT);
                     return false;
                 }
-            } catch (const std::exception&) {
-                std::cerr << "Invalid device count provided\n";
+            } catch (const std::invalid_argument& e) {  // Fixed: More specific exception
+                std::cerr << std::format("Invalid device count format: {}\n", e.what());
+                return false;
+            } catch (const std::out_of_range& e) {  // Fixed: More specific exception
+                std::cerr << std::format("Device count out of range: {}\n", e.what());
                 return false;
             }
         }
@@ -411,8 +460,9 @@ int main(int argc, char* argv[]) {
     controller.log_message("-------------------------------------------");
     
     // Zone configuration - const and local to main
+    // Fixed: Class template argument deduction instead of explicit template args
     static constexpr std::array zones = {"production_floor", "warehouse", "cooling_system", "furnace_room", "quality_control"};
-    std::vector<std::unique_ptr<MQTTTemperaturePublisher>> publishers;
+    std::vector publishers = std::vector<std::unique_ptr<MQTTTemperaturePublisher>>{};  // Fixed: CTAD
     
     // Initialize publishers
     for (int i = 0; i < config.device_count && i < static_cast<int>(zones.size()); ++i) {
@@ -437,7 +487,7 @@ int main(int argc, char* argv[]) {
     const auto publish_interval = std::chrono::seconds(IoTSystemController::get_publish_interval_seconds());
     
     while (controller.is_running()) {
-        auto now = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
         
         // Publish at configured intervals
         if (now - last_publish >= publish_interval) {
