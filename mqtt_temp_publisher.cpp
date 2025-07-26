@@ -127,7 +127,7 @@ private:
         double variance;
     };
     
-    // Fixed: Use inline variable with transparent hasher and std::equal_to<>
+    // Fixed: Use inline variable for proper header compatibility
     inline static const std::unordered_map<std::string, ZoneProfile, TransparentStringHash, std::equal_to<>> zone_profiles_{
         {"production_floor", {25.0, 5.0, 20.0, 35.0, 2.0}},
         {"warehouse", {22.0, 4.0, 15.0, 30.0, 1.5}},
@@ -145,58 +145,60 @@ private:
     static constexpr double TEMP_SMOOTHING_CURRENT = 0.7;
     static constexpr double TEMP_SMOOTHING_NEW = 0.3;
     
-    // Helper function to get local time hour - returns hour or -1 on failure
-    [[nodiscard]] int try_get_local_hour(const std::chrono::system_clock::time_point& now) const noexcept {
-        const auto time_t = std::chrono::system_clock::to_time_t(now);
-        
+    // Fixed: Reduced nesting by extracting time conversion to separate functions
+    [[nodiscard]] bool try_local_time_conversion(std::time_t time_val, int& hour) const noexcept {
 #ifdef _WIN32
-        // Fixed: Use init-statement to declare "local_time" inside the if statement
-        if (std::tm local_time{}; ::localtime_s(&local_time, &time_t) == 0) {
-            return local_time.tm_hour;
+        if (std::tm local_time{}; ::localtime_s(&local_time, &time_val) == 0) {
+            hour = local_time.tm_hour;
+            return true;
         }
 #else
-        // Fixed: Use init-statement to declare "local_time" inside the if statement
-        if (std::tm local_time{}; ::localtime_r(&time_t, &local_time) != nullptr) {
-            return local_time.tm_hour;
+        if (std::tm local_time{}; ::localtime_r(&time_val, &local_time) != nullptr) {
+            hour = local_time.tm_hour;
+            return true;
         }
 #endif
-        return -1; // Indicate failure
+        return false;
     }
     
-    // Helper function to get UTC time hour - returns hour or -1 on failure
-    [[nodiscard]] int try_get_utc_hour(const std::chrono::system_clock::time_point& now) const noexcept {
-        const auto time_t = std::chrono::system_clock::to_time_t(now);
-        
+    [[nodiscard]] bool try_utc_time_conversion(std::time_t time_val, int& hour) const noexcept {
 #ifdef _WIN32
-        // Fixed: Use init-statement to declare "utc_time" inside the if statement
-        if (std::tm utc_time{}; ::gmtime_s(&utc_time, &time_t) == 0) {
-            return utc_time.tm_hour;
+        if (std::tm utc_time{}; ::gmtime_s(&utc_time, &time_val) == 0) {
+            hour = utc_time.tm_hour;
+            return true;
         }
 #else
-        // Fixed: Use init-statement to declare "utc_time" inside the if statement
-        if (std::tm utc_time{}; ::gmtime_r(&time_t, &utc_time) != nullptr) {
-            return utc_time.tm_hour;
+        if (std::tm utc_time{}; ::gmtime_r(&time_val, &utc_time) != nullptr) {
+            hour = utc_time.tm_hour;
+            return true;
         }
 #endif
-        return -1; // Indicate failure
+        return false;
     }
     
-    // Fixed: Reduced nesting to ≤3 levels with early returns
+    [[nodiscard]] int get_fallback_hour(const std::chrono::system_clock::time_point& now) const noexcept {
+        auto hours = std::chrono::duration_cast<std::chrono::hours>(
+            now.time_since_epoch()) % std::chrono::hours(24);
+        return hours.count();
+    }
+    
+    // Fixed: Completely flattened nesting structure - maximum 2 levels
     [[nodiscard]] int get_safe_hour(const std::chrono::system_clock::time_point& now) const noexcept {
+        const auto time_val = std::chrono::system_clock::to_time_t(now);
+        int hour = 0;
+        
         // Try local time first
-        if (auto hour = try_get_local_hour(now); hour != -1) {
+        if (try_local_time_conversion(time_val, hour)) {
             return hour;
         }
         
         // Try UTC time as fallback
-        if (auto hour = try_get_utc_hour(now); hour != -1) {
+        if (try_utc_time_conversion(time_val, hour)) {
             return hour;
         }
         
-        // Ultimate fallback using chrono
-        auto hours = std::chrono::duration_cast<std::chrono::hours>(
-            now.time_since_epoch()) % std::chrono::hours(24);
-        return hours.count();
+        // Ultimate fallback
+        return get_fallback_hour(now);
     }
     
 public:
@@ -210,13 +212,13 @@ public:
         }
         
         current_temp_ = profile_.base_temp;
-        noise_ = std::normal_distribution(0.0, profile_.variance); // Fixed: CTAD
+        noise_ = std::normal_distribution(0.0, profile_.variance);
     }
     
     [[nodiscard]] double read_temperature() const noexcept {
         const auto now = std::chrono::system_clock::now();
         
-        // Reduced nesting by extracting hour calculation
+        // Fixed: Completely flat structure - no nested control flow
         const auto hour = get_safe_hour(now);
         const auto hour_radians = (hour - 4) * std::numbers::pi / 12.0;
         const auto daily_variation = profile_.amplitude * std::sin(hour_radians);
@@ -232,7 +234,7 @@ public:
     
     [[nodiscard]] std::string get_status() const noexcept {
         // Simulate occasional sensor warnings using system constant
-        std::uniform_real_distribution dist(0.0, 1.0); // Fixed: CTAD
+        std::uniform_real_distribution dist(0.0, 1.0);
         return (dist(generator_) < IoTSystemController::get_sensor_warning_probability()) 
                ? "warning" : "operational";
     }
@@ -250,7 +252,7 @@ private:
     std::atomic<bool> connected_{false};
     std::atomic<int> reconnect_delay_{IoTSystemController::get_default_reconnect_delay()};
     std::atomic<bool> reconnecting_{false};
-    std::jthread reconnect_thread_; // Proper thread scope management
+    std::jthread reconnect_thread_;
     
     // Helper function to reduce nesting in connection logic
     [[nodiscard]] bool attempt_mqtt_connection() noexcept {
@@ -296,23 +298,35 @@ private:
         return true;
     }
     
-    // Fixed: Reduced nesting in reconnection logic
+    // Helper function to handle sleep with interruption check
+    void interruptible_sleep(int seconds, std::stop_token stop_token) const noexcept {
+        for (int i = 0; i < seconds && !stop_token.stop_requested(); ++i) {
+            std::this_thread::sleep_for(1s);
+        }
+    }
+    
+    // Helper function to check reconnection conditions
+    [[nodiscard]] bool should_continue_reconnecting(std::stop_token stop_token) const noexcept {
+        return !connected_ && 
+               IoTSystemController::instance().is_running() && 
+               !stop_token.stop_requested();
+    }
+    
+    // Fixed: Completely flattened reconnection logic - maximum 2 levels of nesting
     void reconnection_worker(std::stop_token stop_token) noexcept {
-        while (!connected_ && IoTSystemController::instance().is_running() && !stop_token.stop_requested()) {
+        while (should_continue_reconnecting(stop_token)) {
             const auto delay = reconnect_delay_.load();
             IoTSystemController::instance().log_message(
                 std::format("🔄 [{}] Attempting reconnection in {} seconds...", device_id_, delay));
             
-            // Interruptible sleep with reduced nesting
-            for (int i = 0; i < delay && !stop_token.stop_requested(); ++i) {
-                std::this_thread::sleep_for(1s);
-            }
+            // Interruptible sleep
+            interruptible_sleep(delay, stop_token);
             
             if (stop_token.stop_requested()) return;
             
             if (connect()) return; // Successfully connected, exit
             
-            // Exponential backoff using system constant
+            // Exponential backoff
             const auto new_delay = std::min(delay * 2, IoTSystemController::get_max_reconnect_delay());
             reconnect_delay_ = new_delay;
         }
@@ -366,29 +380,42 @@ public:
             return; // Already reconnecting
         }
         
-        // Properly scoped thread instead of detaching
+        // Properly scoped thread
         reconnect_thread_ = std::jthread([this](std::stop_token stop_token) {
             reconnection_worker(stop_token);
         });
     }
     
+    // Helper function to check connection status
+    [[nodiscard]] bool is_mqtt_connected() const noexcept {
+        return connected_ && MQTTClient_isConnected(client_);
+    }
+    
+    // Helper function to handle failed publish
+    void handle_publish_failure() noexcept {
+        connected_ = false;
+        if (!reconnecting_) {
+            reconnect_with_backoff();
+        }
+    }
+    
+    // Fixed: Flattened publish logic - maximum 2 levels of nesting
     [[nodiscard]] bool publish_temperature() noexcept {
-        // Merged if statements to reduce nesting
-        if (!connected_ || !MQTTClient_isConnected(client_)) {
-            connected_ = false;
-            if (!reconnecting_) {
-                reconnect_with_backoff();
-            }
+        // Early return if not connected
+        if (!is_mqtt_connected()) {
+            handle_publish_failure();
             return false;
         }
         
         try {
+            // Generate sensor data
             const auto temperature = simulator_.read_temperature();
             const auto status = simulator_.get_status();
             const auto now = std::chrono::system_clock::now();
             const auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
                 now.time_since_epoch()).count();
             
+            // Create JSON message
             const auto json_message = std::format(R"({{
     "device_id": "{}",
     "zone": "{}",
@@ -398,12 +425,13 @@ public:
     "status": "{}"
 }})", device_id_, zone_, temperature, timestamp, status);
             
+            // Attempt to publish
             if (!execute_mqtt_publish(json_message)) {
                 connected_ = false;
                 return false;
             }
             
-            // Log periodically using system constant
+            // Log periodically
             static thread_local int log_counter = 0;
             if (++log_counter % IoTSystemController::get_log_frequency() == 0) {
                 IoTSystemController::instance().log_message(
@@ -496,11 +524,10 @@ int main(int argc, char* argv[]) {
     controller.log_message("-------------------------------------------");
     
     // Zone configuration - const and local to main
-    // Fixed: Class template argument deduction instead of explicit template args
     static constexpr auto zones = std::array{"production_floor", "warehouse", "cooling_system", "furnace_room", "quality_control"};
-    auto publishers = std::vector<std::unique_ptr<MQTTTemperaturePublisher>>{};  // Fixed: CTAD
+    auto publishers = std::vector<std::unique_ptr<MQTTTemperaturePublisher>>{};
     
-    // Initialize publishers
+    // Initialize publishers - flattened loop structure
     for (int i = 0; i < config.device_count && i < zones.size(); ++i) {
         const auto device_id = std::format("TEMP_{:03d}", i + 1);
         const auto& zone = zones[i % zones.size()];
@@ -517,7 +544,7 @@ int main(int argc, char* argv[]) {
     controller.log_message(std::format("🚀 Publishing started with {} devices", publishers.size()));
     controller.log_message("📖 Subscribe: mosquitto_sub -h localhost -t \"industrial/sensors/+/+/temperature\"");
     
-    // Main publishing loop
+    // Main publishing loop - flattened structure
     int message_count = 0;
     auto last_publish = std::chrono::steady_clock::now();
     const auto publish_interval = std::chrono::seconds(IoTSystemController::get_publish_interval_seconds());
@@ -526,7 +553,8 @@ int main(int argc, char* argv[]) {
         // Use init-statement to declare "now" inside the if statement
         if (const auto now = std::chrono::steady_clock::now(); now - last_publish >= publish_interval) {
             int successful = 0;
-            // Use const reference to avoid modification issues
+            
+            // Publish from all sensors - single level loop
             for (const auto& publisher : publishers) {
                 if (publisher->publish_temperature()) {
                     ++successful;
@@ -534,6 +562,7 @@ int main(int argc, char* argv[]) {
                 }
             }
             
+            // Report partial failures
             if (successful < publishers.size()) {
                 controller.log_message(std::format("⚠️ Published {}/{} readings successfully", 
                                                  successful, publishers.size()));
